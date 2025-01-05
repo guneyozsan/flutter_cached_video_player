@@ -38,6 +38,7 @@ class CachedVideoPlayerValue {
     this.volume = 1.0,
     this.playbackSpeed = 1.0,
     this.errorDescription,
+    this.isCompleted = false,
   });
 
   /// Returns an instance for a video that hasn't been loaded.
@@ -88,6 +89,12 @@ class CachedVideoPlayerValue {
   /// If [hasError] is false this is `null`.
   final String? errorDescription;
 
+  /// True if video has finished playing to end.
+  ///
+  /// Reverts to false if video position changes, or video begins playing.
+  /// Does not update if video is looping.
+  final bool isCompleted;
+
   /// The [size] of the currently loaded video.
   final Size size;
 
@@ -130,6 +137,7 @@ class CachedVideoPlayerValue {
     double? volume,
     double? playbackSpeed,
     String? errorDescription,
+    bool? isCompleted,
   }) {
     return CachedVideoPlayerValue(
       duration: duration ?? this.duration,
@@ -144,6 +152,7 @@ class CachedVideoPlayerValue {
       volume: volume ?? this.volume,
       playbackSpeed: playbackSpeed ?? this.playbackSpeed,
       errorDescription: errorDescription ?? this.errorDescription,
+      isCompleted: isCompleted ?? this.isCompleted,
     );
   }
 
@@ -161,7 +170,8 @@ class CachedVideoPlayerValue {
         'isBuffering: $isBuffering, '
         'volume: $volume, '
         'playbackSpeed: $playbackSpeed, '
-        'errorDescription: $errorDescription)';
+        'errorDescription: $errorDescription)'
+        'isCompleted: $isCompleted),';
   }
 }
 
@@ -326,15 +336,30 @@ class CachedVideoPlayerController
             duration: event.duration,
             size: event.size,
             isInitialized: event.duration != null,
+            isCompleted: false,
           );
+          assert(
+            !initializingCompleter.isCompleted,
+            'VideoPlayerController already initialized. This is typically a '
+            'sign that an implementation of the VideoPlayerPlatform '
+            '(${_videoPlayerPlatform.runtimeType}) has a bug and is sending '
+            'more than one initialized event per instance.',
+          );
+          if (initializingCompleter.isCompleted) {
+            throw StateError('VideoPlayerController already initialized');
+          }
           initializingCompleter.complete(null);
           _applyLooping();
           _applyVolume();
           _applyPlayPause();
           break;
         case VideoEventType.completed:
-          value = value.copyWith(isPlaying: false, position: value.duration);
-          _timer?.cancel();
+          // In this case we need to stop _timer, set isPlaying=false, and
+          // position=value.duration. Instead of setting the values directly,
+          // we use pause() and seekTo() to ensure the platform stops playing
+          // and seeks to the last frame of the video.
+          pause().then((void pauseResult) => seekTo(value.duration));
+          value = value.copyWith(isCompleted: true);
           break;
         case VideoEventType.bufferingUpdate:
           value = value.copyWith(buffered: event.buffered);
@@ -346,6 +371,14 @@ class CachedVideoPlayerController
           value = value.copyWith(isBuffering: false);
           break;
         case VideoEventType.unknown:
+          break;
+        case VideoEventType.isPlayingStateUpdate:
+          if (event.isPlaying ?? false) {
+            value =
+                value.copyWith(isPlaying: event.isPlaying, isCompleted: false);
+          } else {
+            value = value.copyWith(isPlaying: event.isPlaying);
+          }
           break;
       }
     }
@@ -566,8 +599,17 @@ class CachedVideoPlayerController
   }
 
   void _updatePosition(Duration position) {
-    value = value.copyWith(position: position);
-    value = value.copyWith(caption: _getCaptionAt(position));
+    // The underlying native implementation on some platforms sometimes reports
+    // a position slightly past the reported max duration. Clamp to the duration
+    // to insulate clients from this behavior.
+    if (position > value.duration) {
+      position = value.duration;
+    }
+    value = value.copyWith(
+      position: position,
+      caption: _getCaptionAt(position),
+      isCompleted: position == value.duration,
+    );
   }
 }
 
